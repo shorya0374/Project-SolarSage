@@ -1,0 +1,121 @@
+import sharp from "sharp";
+import type { BBox } from "./schema";
+import { readExif, type ExifMeta } from "./exif";
+
+// Cap decoded pixel count to defend against decompression bombs on the upload
+// path (a small file can expand to gigapixels in memory). 50 megapixels is well
+// above any legitimate drone/phone panel photo while bounding worst-case memory.
+const MAX_INPUT_PIXELS = 50_000_000;
+
+/**
+ * Crop a normalized [ymin, xmin, ymax, xmax] (0-1) region out of `buffer`,
+ * with a small expansion margin so we don't shave the panel frame.
+ * Returns the JPEG buffer of the crop and its actual pixel rect.
+ *
+ * EXIF (including GPS) is preserved on the cropped output so downstream
+ * consumers can still read drone GPS — geo position is invariant under
+ * a simple crop of the same exposure.
+ */
+export async function cropFromBBox(
+  buffer: Buffer,
+  bbox: BBox,
+  opts: { expandRatio?: number; maxWidth?: number; quality?: number } = {}
+): Promise<{ buffer: Buffer; mimeType: string; width: number; height: number }> {
+  const { expandRatio = 0.04, maxWidth = 1280, quality = 88 } = opts;
+
+  const meta = await sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).metadata();
+  const W = meta.width ?? 0;
+  const H = meta.height ?? 0;
+  if (W === 0 || H === 0) throw new Error("Source image has no dimensions");
+
+  let [ymin, xmin, ymax, xmax] = bbox;
+  // expand
+  const dy = (ymax - ymin) * expandRatio;
+  const dx = (xmax - xmin) * expandRatio;
+  ymin = Math.max(0, ymin - dy);
+  xmin = Math.max(0, xmin - dx);
+  ymax = Math.min(1, ymax + dy);
+  xmax = Math.min(1, xmax + dx);
+
+  const left = Math.round(xmin * W);
+  const top = Math.round(ymin * H);
+  const width = Math.max(1, Math.round((xmax - xmin) * W));
+  const height = Math.max(1, Math.round((ymax - ymin) * H));
+
+  let pipeline = sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).extract({ left, top, width, height });
+  if (width > maxWidth) {
+    pipeline = pipeline.resize({ width: maxWidth, withoutEnlargement: true });
+  }
+  const out = await pipeline
+    .withMetadata()
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    buffer: out.data,
+    mimeType: "image/jpeg",
+    width: out.info.width,
+    height: out.info.height,
+  };
+}
+
+export function bufferToDataUrl(buffer: Buffer, mimeType = "image/jpeg"): string {
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
+}
+
+/**
+ * Resize a possibly-huge upload to a sensible analysis size (keeps original aspect),
+ * for both the detection preflight and per-panel calls. Saves tokens + time.
+ *
+ * Reads EXIF (notably GPS) from the original buffer before re-encoding,
+ * and preserves the metadata block on the output JPEG via `withMetadata()`
+ * so downstream crops can keep carrying the drone's GPS.
+ */
+export async function normalizeUpload(
+  buffer: Buffer,
+  mimeType: string,
+  opts: { maxLongEdge?: number; quality?: number } = {}
+): Promise<{
+  buffer: Buffer;
+  mimeType: string;
+  width: number;
+  height: number;
+  exif: ExifMeta;
+}> {
+  const { maxLongEdge = 1600, quality = 90 } = opts;
+
+  // Read EXIF from the *original* upload — sharp re-encodes can subtly
+  // reshuffle tags. Non-fatal: bad EXIF returns EMPTY_EXIF.
+  const exif = await readExif(buffer);
+
+  const meta = await sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).metadata();
+  const W = meta.width ?? 0;
+  const H = meta.height ?? 0;
+  const long = Math.max(W, H);
+  let pipe = sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).rotate(); // honor EXIF orientation
+  if (long > maxLongEdge) {
+    pipe = pipe.resize({
+      width: W >= H ? maxLongEdge : undefined,
+      height: H > W ? maxLongEdge : undefined,
+      withoutEnlargement: true,
+    });
+  }
+  // re-encode to JPEG for consistent downstream handling, keep metadata so
+  // crop pipeline below can still surface GPS.
+  const out = await pipe
+    .withMetadata()
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer({ resolveWithObject: true });
+
+  // Suppress unused import lint; mimeType arg is part of the public surface
+  // but not used internally — sharp sniffs format from the buffer.
+  void mimeType;
+
+  return {
+    buffer: out.data,
+    mimeType: "image/jpeg",
+    width: out.info.width,
+    height: out.info.height,
+    exif,
+  };
+}
